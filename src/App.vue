@@ -1,11 +1,17 @@
-<script setup></script>
+<script setup>
+import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import { useNotificationsStore } from '@/stores/notifications'
+
+const notifications = useNotificationsStore()
+</script>
 
 <template>
-  <h1>You did it!</h1>
-  <p>
-    Visit <a href="https://vuejs.org/" target="_blank" rel="noopener">vuejs.org</a> to read the
-    documentation
-  </p>
-</template>
+  <v-app>
+    <!-- The router picks the layout (AdminLayout for now; a login page could use none). -->
+    <RouterView />
 
-<style scoped></style>
+    <!-- App-wide UI, rendered once and driven by Pinia stores. -->
+    <v-snackbar-queue v-model="notifications.queue" location="bottom right" closable />
+    <ConfirmDialog />
+  </v-app>
+</template>

@@ -1,15 +1,46 @@
 import { fileURLToPath, URL } from 'node:url'
 
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import vueDevTools from 'vite-plugin-vue-devtools'
+import vuetify from 'vite-plugin-vuetify'
 
 // https://vite.dev/config/
-export default defineConfig({
-  plugins: [vue(), vueDevTools()],
-  resolve: {
-    alias: {
-      '@': fileURLToPath(new URL('./src', import.meta.url)),
+export default defineConfig(({ mode }) => {
+  // Loads .env, .env.[mode] and their .local versions. The '' prefix also
+  // loads variables without VITE_, which stay in this config and never reach
+  // the browser bundle.
+  const env = loadEnv(mode, process.cwd(), '')
+
+  return {
+    plugins: [
+      vue(),
+      // Imports only the Vuetify components and directives the app uses.
+      vuetify({ autoImport: true }),
+      vueDevTools(),
+    ],
+    server: {
+      proxy: {
+        // The browser calls /api/posts on the dev server's own origin, and Vite
+        // forwards it server-side to the API as /posts. Same origin for the
+        // browser, so the API needs no CORS setup for local development.
+        '/api': {
+          // The deployed API on ECS, or a local uvicorn (see .env.example).
+          target: env.API_PROXY_TARGET || 'http://localhost:8000',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api/, ''),
+        },
+      },
     },
-  },
+    resolve: {
+      alias: {
+        '@': fileURLToPath(new URL('./src', import.meta.url)),
+      },
+    },
+    test: {
+      // Vuetify components import their own CSS, which plain Node can't load;
+      // inlining sends Vuetify through Vite's pipeline, which handles it.
+      server: { deps: { inline: ['vuetify'] } },
+    },
+  }
 })

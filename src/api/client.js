@@ -2,9 +2,11 @@
 // `request`, so the base URL, the auth header and error handling live here only.
 import { fetchAuthSession } from 'aws-amplify/auth'
 
-// In development this is '/api', which the Vite dev server proxies to the API
-// (see vite.config.js), so the browser never makes a cross-origin call.
-// A production build can point it elsewhere with VITE_API_BASE_URL.
+// '/api' on the site's own origin: the Vite dev server (see vite.config.js) and
+// CloudFront in production both forward /api/* to the API, which serves its
+// endpoints under /api. So the browser never makes a cross-origin call.
+// VITE_API_BASE_URL can point a build straight at the API instead, e.g.
+// https://<service>.ecs.ap-southeast-1.on.aws/api (the API then needs CORS).
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api'
 
 // What the user sees for auth errors (spec FE-SES-05, FE-SES-06).

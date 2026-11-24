@@ -1,17 +1,22 @@
-name: CI
+name: CI/CD
 
+# CI: pull requests into main (lint, format, tests, build).
+# CD: a push to main, i.e. a merged PR, runs the same checks again on the
+# merged code, then deploys.
 on:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
 
 permissions:
   contents: read
 
-# A newer push to the same branch or PR cancels the run it makes outdated.
+# On a pull request, a newer push cancels the run it makes outdated. On main,
+# runs are never cancelled, so a deploy is never killed halfway through.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -34,5 +39,125 @@ jobs:
       - run: npm test
 
       # The Cognito IDs are only read when the app starts in a browser, so the
-      # build needs no real values. Deploys will set them (see .env.example).
+      # build needs no real values. The deploy job below sets them.
       - run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Deploy to S3 + CloudFront (dev). Runs after a merge to main, once the
+  # checks pass.
+  #
+  # Hosting: the built files live in a private S3 bucket that only the
+  # CloudFront distribution can read (OAC). CloudFront sends /api/* to the API
+  # on ECS and everything else to S3, where a CloudFront Function serves
+  # index.html for app routes such as /posts.
+  #
+  # Uses the IAM user `github-actions-deploy`. Its `AdminSite*` policy
+  # statements allow only: list, upload and delete in the site bucket, and
+  # create invalidations on the one distribution.
+  #
+  # Settings come from the GitHub environment `dev`:
+  #   secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+  #   variables: AWS_REGION, S3_BUCKET, CLOUDFRONT_DISTRIBUTION_ID,
+  #              VITE_COGNITO_USER_POOL_ID, VITE_COGNITO_USER_POOL_CLIENT_ID
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to S3 + CloudFront (dev)
+
+    # Wait for the `check` job above. If it fails, this job is skipped.
+    needs: check
+
+    # Pull requests run the checks only. Deploy only when code lands on main.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    # Gives this job the `dev` environment's secrets and variables (the PR
+    # checks can't read them), and links the run to the site in the GitHub UI.
+    environment:
+      name: dev
+      url: https://d330z883zwqhow.cloudfront.net
+
+    # Two quick merges deploy one after the other, never at the same time.
+    concurrency:
+      group: deploy-admin-site-dev
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # A missing variable doesn't break the build: Vite just bakes in
+      # `undefined`, and sign-in fails in the browser after the deploy. So
+      # check every setting first and stop here with a clear message.
+      - name: Check deploy settings
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+          VITE_COGNITO_USER_POOL_ID: ${{ vars.VITE_COGNITO_USER_POOL_ID }}
+          VITE_COGNITO_USER_POOL_CLIENT_ID: ${{ vars.VITE_COGNITO_USER_POOL_CLIENT_ID }}
+        run: |
+          missing=0
+          for name in AWS_REGION S3_BUCKET CLOUDFRONT_DISTRIBUTION_ID \
+                      VITE_COGNITO_USER_POOL_ID VITE_COGNITO_USER_POOL_CLIENT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Variable $name is not set in the 'dev' environment."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      # Vite replaces import.meta.env.VITE_* with these values at build time,
+      # so they end up in the JS files. VITE_API_BASE_URL is left unset on
+      # purpose: the app calls /api on its own CloudFront domain.
+      - name: Build
+        env:
+          VITE_COGNITO_USER_POOL_ID: ${{ vars.VITE_COGNITO_USER_POOL_ID }}
+          VITE_COGNITO_USER_POOL_CLIENT_ID: ${{ vars.VITE_COGNITO_USER_POOL_CLIENT_ID }}
+        run: npm run build
+
+      # Exports the access key as environment variables, so the `aws` commands
+      # below run as github-actions-deploy. GitHub masks the secrets in logs.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Hashed files (assets/index-DCky55Ff.js): a new build gives changed
+      # files new names, so browsers and CloudFront may cache them for a year.
+      # Uploaded before index.html, so index.html never points at a file that
+      # isn't there yet. No --delete: someone with the old version still open
+      # may need the old chunks when they navigate.
+      - name: Upload assets
+        run: >-
+          aws s3 sync dist/assets "s3://${{ vars.S3_BUCKET }}/assets"
+          --cache-control "public, max-age=31536000, immutable"
+          --no-progress
+
+      # Everything else (index.html, favicon.ico) keeps its name between
+      # builds, so it must be revalidated on every request ("no-cache" still
+      # allows a cheap 304 when nothing changed). --delete removes files that
+      # are no longer in the build, but never touches the excluded assets/.
+      - name: Upload index.html and other files
+        run: >-
+          aws s3 sync dist "s3://${{ vars.S3_BUCKET }}"
+          --exclude "assets/*"
+          --cache-control "no-cache"
+          --delete
+          --no-progress
+
+      # CloudFront edges may still hold the old index.html. Hashed assets never
+      # need invalidating. The first 1,000 paths a month are free.
+      - name: Invalidate CloudFront cache
+        run: >-
+          aws cloudfront create-invalidation
+          --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}"
+          --paths "/index.html"

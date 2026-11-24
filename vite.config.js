@@ -22,13 +22,14 @@ export default defineConfig(({ mode }) => {
     server: {
       proxy: {
         // The browser calls /api/posts on the dev server's own origin, and Vite
-        // forwards it server-side to the API as /posts. Same origin for the
-        // browser, so the API needs no CORS setup for local development.
+        // forwards it server-side, path unchanged, to the API, which serves
+        // every endpoint under /api. Same origin for the browser, so the API
+        // needs no CORS setup. CloudFront does the same in production: it
+        // sends /api/* to the API and everything else to the S3 site.
         '/api': {
           // The deployed API on ECS, or a local uvicorn (see .env.example).
           target: env.API_PROXY_TARGET || 'http://localhost:8000',
           changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api/, ''),
         },
       },
     },
